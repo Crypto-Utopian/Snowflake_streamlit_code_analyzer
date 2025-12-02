@@ -28,13 +28,24 @@ Follow the instructions in `DEPLOYMENT_GUIDE.md`:
 
 ## Features
 
-### Analysis Capabilities
-- **Cartesian Join Detection**: Identifies queries with missing JOIN conditions
-- **Memory Spilling Analysis**: Detects queries spilling to disk
-- **Warehouse Sizing Issues**: Finds oversized/undersized warehouses
-- **Partition Pruning Efficiency**: Highlights poor data pruning
-- **Cache Utilization**: Identifies low cache hit rates
-- **Compilation Overhead**: Detects excessive compilation times
+### Analysis Capabilities (15+ Detectors)
+
+**SQL Anti-Patterns:**
+- **SELECT * Detection**: Identifies queries selecting all columns unnecessarily
+- **Cartesian Join Detection**: Missing JOIN conditions, CROSS JOINs, OR in JOINs
+- **UNION vs UNION ALL**: Detects unnecessary duplicate elimination
+- **Functions on Filter Columns**: YEAR(), DATE(), UPPER() etc. disabling pruning
+
+**Performance Issues:**
+- **Memory Spilling Analysis**: Local and remote spilling (warehouse undersizing)
+- **Poor Partition Pruning**: High partition scan percentages
+- **Warehouse Sizing Issues**: Oversized/undersized warehouses, queuing
+- **Cache Utilization**: Low cache hit rates on expensive queries
+- **Compilation Overhead**: Excessive query compilation times
+- **Repeated Expensive Queries**: Same costly queries running repeatedly
+- **Full Table Scans**: Large unfiltered scans
+- **Query Retries**: OOM and failure recovery issues
+- **Cloud Services Credits**: High metadata operation costs
 
 ### Visualizations
 - Credit usage trends
