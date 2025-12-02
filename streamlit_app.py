@@ -92,8 +92,9 @@ def analyze_cartesian_joins(df):
     for idx, row in df.iterrows():
         query_text = str(row['QUERY_TEXT']).upper()
         
-        has_join = 'JOIN' in query_text and 'ON' in query_text
-        missing_on = 'JOIN' in query_text and 'ON' not in query_text
+        has_join = 'JOIN' in query_text
+        has_on_or_using = 'ON' in query_text or 'USING' in query_text
+        missing_join_condition = has_join and not has_on_or_using
         has_cross_join = 'CROSS JOIN' in query_text
         
         rows_produced = row['ROWS_PRODUCED'] if pd.notna(row['ROWS_PRODUCED']) else 0
@@ -101,12 +102,12 @@ def analyze_cartesian_joins(df):
         
         high_row_explosion = rows_produced > 1000000 and (rows_produced / max(bytes_scanned, 1)) > 10
         
-        if missing_on or has_cross_join or high_row_explosion:
-            severity = 'CRITICAL' if missing_on or has_cross_join else 'HIGH'
+        if missing_join_condition or has_cross_join or high_row_explosion:
+            severity = 'CRITICAL' if missing_join_condition or has_cross_join else 'HIGH'
             reason = []
             
-            if missing_on:
-                reason.append("Missing ON clause in JOIN")
+            if missing_join_condition:
+                reason.append("Missing ON/USING clause in JOIN")
             if has_cross_join:
                 reason.append("Explicit CROSS JOIN detected")
             if high_row_explosion:
@@ -121,7 +122,7 @@ def analyze_cartesian_joins(df):
                 'SEVERITY': severity,
                 'ISSUE': 'Potential Cartesian Join',
                 'REASON': ' | '.join(reason),
-                'RECOMMENDATION': 'Add explicit JOIN conditions with ON clause. Avoid CROSS JOINs unless necessary. Consider using range join optimization or ASOF joins for time-series data.'
+                'RECOMMENDATION': 'Add explicit JOIN conditions with ON or USING clause. Avoid CROSS JOINs unless necessary. Consider using range join optimization or ASOF joins for time-series data.'
             })
     
     return pd.DataFrame(issues)
@@ -406,6 +407,17 @@ if not df.empty:
             )
         else:
             st.success("✅ No compilation issues detected")
+        
+        st.markdown("---")
+        
+        if not cache_issues.empty:
+            st.subheader("🟣 Low Cache Efficiency")
+            st.dataframe(
+                cache_issues[['QUERY_ID', 'USER_NAME', 'WAREHOUSE', 'EXECUTION_TIME_SEC', 'CACHE_PERCENTAGE', 'RECOMMENDATION']],
+                use_container_width=True
+            )
+        else:
+            st.success("✅ No cache efficiency issues detected")
     
     with tab3:
         st.subheader("⚠️ Top 20 Most Expensive Queries")
@@ -493,7 +505,7 @@ if not df.empty:
         all_issues.append(f"🔵 **{len(pruning_issues)} Pruning Issues**: Add clustering keys or improve WHERE clause filters")
     
     if not cache_issues.empty:
-        all_issues.append(f"⚪ **{len(cache_issues)} Cache Efficiency Issues**: Adjust auto-suspend settings or consolidate queries")
+        all_issues.append(f"🟣 **{len(cache_issues)} Cache Efficiency Issues**: Adjust auto-suspend settings or consolidate queries")
     
     if not compilation_issues.empty:
         all_issues.append(f"⚪ **{len(compilation_issues)} Compilation Issues**: Simplify complex queries or break them down")
