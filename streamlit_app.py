@@ -5,6 +5,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
 import re
+import numpy as np
 
 st.set_page_config(layout="wide", page_icon="❄️", page_title="Snowflake Credit Usage Analyzer")
 
@@ -12,14 +13,13 @@ session = get_active_session()
 
 st.title("❄️ Snowflake Credit Usage Analyzer")
 st.markdown("**Identify and fix credit-wasting queries**")
-st.markdown("---")
 
 if 'active_section' not in st.session_state:
     st.session_state.active_section = None
 
 @st.cache_data(ttl=300)
-def load_query_history():
-    query = """
+def load_query_history(hours_back=24):
+    query = f"""
     SELECT 
         QUERY_ID,
         QUERY_TEXT,
@@ -57,7 +57,7 @@ def load_query_history():
         QUERY_RETRY_TIME,
         QUERY_RETRY_CAUSE
     FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY
-    WHERE START_TIME >= DATEADD('hour', -24, CURRENT_TIMESTAMP())
+    WHERE START_TIME >= DATEADD('hour', -{hours_back}, CURRENT_TIMESTAMP())
         AND EXECUTION_STATUS = 'SUCCESS'
         AND QUERY_TYPE NOT IN ('SHOW', 'DESCRIBE', 'USE', 'GRANT', 'REVOKE')
         AND TOTAL_ELAPSED_TIME > 1000
@@ -72,12 +72,12 @@ def load_query_history():
         return df
     except Exception as e:
         st.error(f"Error loading query history: {str(e)}")
-        st.info("Note: This app requires access to SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY. Please ensure you have ACCOUNTADMIN role or appropriate privileges.")
+        st.info("Note: This app requires access to SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY.")
         return pd.DataFrame()
 
 @st.cache_data(ttl=300)
-def load_warehouse_metering():
-    query = """
+def load_warehouse_metering(hours_back=24):
+    query = f"""
     SELECT 
         WAREHOUSE_NAME,
         START_TIME,
@@ -86,7 +86,7 @@ def load_warehouse_metering():
         CREDITS_USED_COMPUTE,
         CREDITS_USED_CLOUD_SERVICES
     FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY
-    WHERE START_TIME >= DATEADD('hour', -24, CURRENT_TIMESTAMP())
+    WHERE START_TIME >= DATEADD('hour', -{hours_back}, CURRENT_TIMESTAMP())
     ORDER BY START_TIME DESC
     """
     
@@ -94,8 +94,20 @@ def load_warehouse_metering():
         df = session.sql(query).to_pandas()
         return df
     except Exception as e:
-        st.warning(f"Could not load warehouse metering data: {str(e)}")
         return pd.DataFrame()
+
+def apply_filters(df, users, roles, warehouses, databases):
+    """Apply user-selected filters to the dataframe"""
+    filtered = df.copy()
+    if users:
+        filtered = filtered[filtered['USER_NAME'].isin(users)]
+    if roles:
+        filtered = filtered[filtered['ROLE_NAME'].isin(roles)]
+    if warehouses:
+        filtered = filtered[filtered['WAREHOUSE_NAME'].isin(warehouses)]
+    if databases:
+        filtered = filtered[filtered['DATABASE_NAME'].isin(databases)]
+    return filtered
 
 def analyze_select_star(df):
     issues = []
@@ -219,7 +231,6 @@ def analyze_spilling(df):
         remote_spill = row['BYTES_SPILLED_TO_REMOTE_STORAGE'] if pd.notna(row['BYTES_SPILLED_TO_REMOTE_STORAGE']) else 0
         if local_spill > 0 or remote_spill > 0:
             severity = 'CRITICAL' if remote_spill > 0 else 'HIGH'
-            total_spill_gb = (local_spill + remote_spill) / (1024**3)
             current_size = row['WAREHOUSE_SIZE'] if pd.notna(row['WAREHOUSE_SIZE']) else 'UNKNOWN'
             issues.append({
                 'QUERY_ID': row['QUERY_ID'],
@@ -259,6 +270,8 @@ def analyze_poor_pruning(df):
 
 def analyze_warehouse_sizing(df):
     issues = []
+    if df.empty:
+        return pd.DataFrame(issues)
     grouped = df.groupby(['WAREHOUSE_NAME', 'WAREHOUSE_SIZE']).agg({
         'EXECUTION_TIME_SEC': ['mean', 'max', 'count'],
         'QUEUED_OVERLOAD_TIME': 'sum',
@@ -296,7 +309,7 @@ def analyze_warehouse_sizing(df):
 
 def analyze_repeated_expensive_queries(df):
     issues = []
-    if 'QUERY_PARAMETERIZED_HASH' not in df.columns:
+    if 'QUERY_PARAMETERIZED_HASH' not in df.columns or df.empty:
         return pd.DataFrame(issues)
     grouped = df.groupby('QUERY_PARAMETERIZED_HASH').agg({
         'QUERY_ID': 'first',
@@ -391,21 +404,102 @@ def analyze_full_table_scans(df):
             })
     return pd.DataFrame(issues)
 
-@st.cache_data(ttl=300)
-def run_all_analyses(_df):
+def analyze_anomalies(df):
+    """Detect anomalous query patterns: redundant runs, off-hours, runtime spikes"""
+    issues = []
+    
+    if df.empty or 'QUERY_PARAMETERIZED_HASH' not in df.columns:
+        return pd.DataFrame(issues)
+    
+    df_sorted = df.sort_values('START_TIME')
+    
+    for query_hash, group in df_sorted.groupby('QUERY_PARAMETERIZED_HASH'):
+        if len(group) < 3:
+            continue
+        
+        times = pd.to_datetime(group['START_TIME']).sort_values()
+        gaps = times.diff().dt.total_seconds().dropna()
+        
+        short_gap_count = (gaps < 900).sum()
+        
+        if short_gap_count >= 2:
+            total_time = group['EXECUTION_TIME_SEC'].sum()
+            first_row = group.iloc[0]
+            query_preview = str(first_row['QUERY_TEXT'])[:80] + '...'
+            
+            issues.append({
+                'TYPE': 'Redundant Executions',
+                'QUERY_ID': first_row['QUERY_ID'],
+                'USER_NAME': first_row['USER_NAME'],
+                'WAREHOUSE': first_row['WAREHOUSE_NAME'],
+                'EXEC_COUNT': len(group),
+                'SHORT_GAPS': int(short_gap_count),
+                'TOTAL_TIME_SEC': round(total_time, 2),
+                'QUERY_PREVIEW': query_preview,
+                'SEVERITY': 'HIGH' if short_gap_count >= 5 else 'MEDIUM',
+                'RECOMMENDATION': 'Review scheduling - query runs multiple times within 15 min windows'
+            })
+    
+    for idx, row in df.iterrows():
+        start_time = pd.to_datetime(row['START_TIME'])
+        hour = start_time.hour
+        
+        if hour >= 0 and hour < 5:
+            issues.append({
+                'TYPE': 'Off-Hours Query',
+                'QUERY_ID': row['QUERY_ID'],
+                'USER_NAME': row['USER_NAME'],
+                'WAREHOUSE': row['WAREHOUSE_NAME'],
+                'START_TIME': str(start_time),
+                'HOUR': hour,
+                'EXECUTION_TIME_SEC': row['EXECUTION_TIME_SEC'],
+                'SEVERITY': 'LOW',
+                'RECOMMENDATION': f'Query ran at {hour}:00 - verify this is intentional scheduling'
+            })
+    
+    if len(df) >= 10:
+        for query_hash, group in df.groupby('QUERY_PARAMETERIZED_HASH'):
+            if len(group) < 3:
+                continue
+            
+            exec_times = group['EXECUTION_TIME_SEC']
+            median_time = exec_times.median()
+            std_time = exec_times.std()
+            
+            if std_time > 0 and median_time > 0:
+                for idx, row in group.iterrows():
+                    z_score = (row['EXECUTION_TIME_SEC'] - median_time) / std_time
+                    
+                    if z_score > 3 and row['EXECUTION_TIME_SEC'] > median_time * 3:
+                        issues.append({
+                            'TYPE': 'Runtime Spike',
+                            'QUERY_ID': row['QUERY_ID'],
+                            'USER_NAME': row['USER_NAME'],
+                            'WAREHOUSE': row['WAREHOUSE_NAME'],
+                            'EXECUTION_TIME_SEC': round(row['EXECUTION_TIME_SEC'], 2),
+                            'MEDIAN_TIME_SEC': round(median_time, 2),
+                            'Z_SCORE': round(z_score, 2),
+                            'SEVERITY': 'HIGH',
+                            'RECOMMENDATION': f'Query took {row["EXECUTION_TIME_SEC"]:.0f}s vs median {median_time:.0f}s - investigate cause'
+                        })
+    
+    return pd.DataFrame(issues)
+
+def run_all_analyses(df):
     """Run all analyses once and return counts and DataFrames"""
     results = {
-        'select_star': analyze_select_star(_df),
-        'cartesian': analyze_cartesian_joins(_df),
-        'union': analyze_union_vs_union_all(_df),
-        'function_filter': analyze_function_on_filter(_df),
-        'spilling': analyze_spilling(_df),
-        'pruning': analyze_poor_pruning(_df),
-        'warehouse': analyze_warehouse_sizing(_df),
-        'repeated': analyze_repeated_expensive_queries(_df),
-        'compilation': analyze_long_compilation(_df),
-        'cache': analyze_cache_efficiency(_df),
-        'full_scan': analyze_full_table_scans(_df),
+        'select_star': analyze_select_star(df),
+        'cartesian': analyze_cartesian_joins(df),
+        'union': analyze_union_vs_union_all(df),
+        'function_filter': analyze_function_on_filter(df),
+        'spilling': analyze_spilling(df),
+        'pruning': analyze_poor_pruning(df),
+        'warehouse': analyze_warehouse_sizing(df),
+        'repeated': analyze_repeated_expensive_queries(df),
+        'compilation': analyze_long_compilation(df),
+        'cache': analyze_cache_efficiency(df),
+        'full_scan': analyze_full_table_scans(df),
+        'anomalies': analyze_anomalies(df),
     }
     
     counts = {name: len(df_result) for name, df_result in results.items()}
@@ -415,7 +509,7 @@ def run_all_analyses(_df):
     counts['operational'] = counts['repeated'] + counts['full_scan']
     counts['total'] = sum(counts[k] for k in ['select_star', 'cartesian', 'union', 'function_filter', 
                                                'spilling', 'pruning', 'warehouse', 'compilation', 
-                                               'cache', 'repeated', 'full_scan'])
+                                               'cache', 'repeated', 'full_scan', 'anomalies'])
     
     critical_count = 0
     for name, df_result in results.items():
@@ -425,8 +519,39 @@ def run_all_analyses(_df):
     
     return results, counts
 
-df = load_query_history()
-warehouse_df = load_warehouse_metering()
+with st.sidebar:
+    st.header("🔧 Filters")
+    
+    hours_back = st.slider("Time Window (hours)", min_value=1, max_value=168, value=24, step=1)
+    
+    raw_df = load_query_history(hours_back)
+    warehouse_df = load_warehouse_metering(hours_back)
+    
+    if not raw_df.empty:
+        st.markdown("---")
+        
+        all_users = sorted(raw_df['USER_NAME'].dropna().unique().tolist())
+        selected_users = st.multiselect("Users", options=all_users, default=[], placeholder="All users")
+        
+        all_roles = sorted(raw_df['ROLE_NAME'].dropna().unique().tolist())
+        selected_roles = st.multiselect("Roles", options=all_roles, default=[], placeholder="All roles")
+        
+        all_warehouses = sorted(raw_df['WAREHOUSE_NAME'].dropna().unique().tolist())
+        selected_warehouses = st.multiselect("Warehouses", options=all_warehouses, default=[], placeholder="All warehouses")
+        
+        all_databases = sorted(raw_df['DATABASE_NAME'].dropna().unique().tolist())
+        selected_databases = st.multiselect("Databases", options=all_databases, default=[], placeholder="All databases")
+        
+        st.markdown("---")
+        st.caption(f"Raw data: {len(raw_df):,} queries")
+        
+        df = apply_filters(raw_df, selected_users, selected_roles, selected_warehouses, selected_databases)
+        
+        st.caption(f"Filtered: {len(df):,} queries")
+    else:
+        df = raw_df
+
+st.markdown("---")
 
 if not df.empty:
     results, counts = run_all_analyses(df)
@@ -435,7 +560,7 @@ if not df.empty:
     
     col1, col2, col3, col4, col5 = st.columns(5)
     with col1:
-        st.metric("Total Queries", f"{len(df):,}")
+        st.metric("Queries Analyzed", f"{len(df):,}")
     with col2:
         st.metric("Total Issues", counts['total'], delta="needs attention" if counts['total'] > 0 else None, delta_color="inverse")
     with col3:
@@ -443,34 +568,37 @@ if not df.empty:
     with col4:
         if not warehouse_df.empty:
             total_credits = warehouse_df['CREDITS_USED'].sum()
-            st.metric("Credits Used (24h)", f"{total_credits:.2f}")
+            st.metric(f"Credits ({hours_back}h)", f"{total_credits:.2f}")
         else:
-            st.metric("Credits Used", "N/A")
+            st.metric("Credits", "N/A")
     with col5:
-        avg_time = df['EXECUTION_TIME_SEC'].mean()
-        st.metric("Avg Query Time", f"{avg_time:.1f}s")
+        st.metric("Anomalies", counts['anomalies'], delta="investigate!" if counts['anomalies'] > 0 else None, delta_color="inverse")
     
     st.markdown("---")
     
     st.subheader("🔍 Issue Categories")
     st.markdown("*Click a category to view detailed issues*")
     
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
     
     with col1:
-        if st.button(f"🔴 SQL Anti-Patterns\n({counts['sql_antipatterns']} issues)", use_container_width=True):
+        if st.button(f"🔴 SQL Anti-Patterns\n({counts['sql_antipatterns']})", use_container_width=True):
             st.session_state.active_section = 'sql_antipatterns'
     
     with col2:
-        if st.button(f"⚡ Performance Issues\n({counts['performance']} issues)", use_container_width=True):
+        if st.button(f"⚡ Performance\n({counts['performance']})", use_container_width=True):
             st.session_state.active_section = 'performance'
     
     with col3:
-        if st.button(f"🔄 Operational Issues\n({counts['operational']} issues)", use_container_width=True):
+        if st.button(f"🔄 Operational\n({counts['operational']})", use_container_width=True):
             st.session_state.active_section = 'operational'
     
     with col4:
-        if st.button(f"📈 Trends & Charts", use_container_width=True):
+        if st.button(f"🔮 Anomalies\n({counts['anomalies']})", use_container_width=True):
+            st.session_state.active_section = 'anomalies'
+    
+    with col5:
+        if st.button(f"📈 Trends", use_container_width=True):
             st.session_state.active_section = 'trends'
     
     st.markdown("---")
@@ -491,43 +619,20 @@ if not df.empty:
         if counts['select_star'] > 0:
             with st.expander(f"📌 SELECT * Usage ({counts['select_star']} queries)", expanded=True):
                 st.markdown("**Problem:** SELECT * scans all columns, wasting I/O")
-                st.markdown("**Fix:** Replace with specific column names")
-                st.code("""-- Instead of:
-SELECT * FROM my_table
-
--- Use:
-SELECT column1, column2 FROM my_table""", language='sql')
+                st.code("-- Use specific columns:\nSELECT col1, col2 FROM table", language='sql')
                 st.dataframe(results['select_star'][['QUERY_ID', 'USER_NAME', 'WAREHOUSE', 'BYTES_SCANNED_GB', 'SEVERITY']].head(10), use_container_width=True)
         
         if counts['cartesian'] > 0:
             with st.expander(f"⚠️ Cartesian Join Issues ({counts['cartesian']} queries)", expanded=True):
-                st.markdown("**Problem:** Missing or incorrect JOIN conditions cause row explosion")
-                st.markdown("**Fix:** Add explicit ON clauses to all JOINs")
-                st.code("""-- Instead of:
-SELECT * FROM orders, customers
-
--- Use:
-SELECT o.*, c.name 
-FROM orders o
-JOIN customers c ON o.customer_id = c.id""", language='sql')
+                st.markdown("**Problem:** Missing JOIN conditions cause row explosion")
+                st.code("-- Add ON clause:\nJOIN customers c ON o.customer_id = c.id", language='sql')
                 st.dataframe(results['cartesian'][['QUERY_ID', 'USER_NAME', 'PROBLEM', 'ROWS_PRODUCED', 'SEVERITY']].head(10), use_container_width=True)
         
         if counts['function_filter'] > 0:
-            with st.expander(f"🔶 Functions on Filter Columns ({counts['function_filter']} queries)", expanded=True):
-                st.markdown("**Problem:** Functions like YEAR(), DATE() on WHERE columns disable partition pruning")
-                st.markdown("**Fix:** Use date range filters instead")
-                st.code("""-- Instead of:
-WHERE YEAR(order_date) = 2024
-
--- Use:
-WHERE order_date >= '2024-01-01' 
-  AND order_date < '2025-01-01'""", language='sql')
+            with st.expander(f"🔶 Functions on Filters ({counts['function_filter']} queries)", expanded=True):
+                st.markdown("**Problem:** Functions on WHERE columns disable pruning")
+                st.code("-- Use date ranges:\nWHERE date >= '2024-01-01' AND date < '2025-01-01'", language='sql')
                 st.dataframe(results['function_filter'][['QUERY_ID', 'USER_NAME', 'FUNCTIONS', 'PARTITIONS_SCANNED', 'SEVERITY']].head(10), use_container_width=True)
-        
-        if counts['union'] > 0:
-            with st.expander(f"🔵 UNION vs UNION ALL ({counts['union']} queries)"):
-                st.markdown("**Problem:** UNION removes duplicates (slow). UNION ALL keeps all rows (fast)")
-                st.dataframe(results['union'][['QUERY_ID', 'USER_NAME', 'EXECUTION_TIME_SEC']].head(10), use_container_width=True)
         
         if counts['sql_antipatterns'] == 0:
             st.success("No SQL anti-pattern issues detected!")
@@ -549,47 +654,20 @@ WHERE order_date >= '2024-01-01'
         
         if counts['spilling'] > 0:
             with st.expander(f"🔴 Memory Spilling ({counts['spilling']} queries)", expanded=True):
-                st.markdown("**Problem:** Query exceeds memory, spilling to disk slows execution")
-                st.markdown("**Fix:** Upgrade warehouse size OR break query into smaller steps")
-                st.code("""-- Option 1: Upgrade warehouse
-ALTER WAREHOUSE my_wh SET WAREHOUSE_SIZE = 'LARGE';
-
--- Option 2: Break into temp tables
-CREATE TEMP TABLE step1 AS SELECT ... WHERE date_filter;
-SELECT * FROM step1 JOIN ...;""", language='sql')
+                st.markdown("**Problem:** Query exceeds memory, spilling to disk")
+                st.code("ALTER WAREHOUSE my_wh SET WAREHOUSE_SIZE = 'LARGE';", language='sql')
                 display_cols = ['QUERY_ID', 'USER_NAME', 'WAREHOUSE_SIZE', 'LOCAL_SPILL_GB', 'REMOTE_SPILL_GB', 'SEVERITY']
                 st.dataframe(results['spilling'][display_cols].head(10), use_container_width=True)
         
         if counts['pruning'] > 0:
             with st.expander(f"🟠 Poor Partition Pruning ({counts['pruning']} queries)", expanded=True):
-                st.markdown("**Problem:** Scanning too many partitions wastes I/O and credits")
-                st.markdown("**Fix:** Add filters on clustered columns or add clustering keys")
-                st.code("""-- Check clustering:
-SELECT SYSTEM$CLUSTERING_INFORMATION('my_table');
-
--- Add clustering key:
-ALTER TABLE my_table CLUSTER BY (date_column);
-
--- Always filter on clustered columns:
-SELECT * FROM my_table WHERE date_column >= '2024-01-01'""", language='sql')
+                st.markdown("**Problem:** Scanning too many partitions")
+                st.code("ALTER TABLE my_table CLUSTER BY (date_column);", language='sql')
                 st.dataframe(results['pruning'][['QUERY_ID', 'USER_NAME', 'PARTITIONS', 'SCAN_PCT', 'BYTES_SCANNED_GB']].head(10), use_container_width=True)
         
         if counts['warehouse'] > 0:
-            with st.expander(f"🟡 Warehouse Sizing Issues ({counts['warehouse']} issues)", expanded=True):
-                st.markdown("**Problem:** Oversized warehouses waste credits; undersized cause queuing")
+            with st.expander(f"🟡 Warehouse Sizing ({counts['warehouse']} issues)", expanded=True):
                 st.dataframe(results['warehouse'].head(10), use_container_width=True)
-        
-        if counts['compilation'] > 0:
-            with st.expander(f"🔵 Slow Query Compilation ({counts['compilation']} queries)"):
-                st.markdown("**Problem:** Complex queries take too long to compile")
-                st.markdown("**Fix:** Simplify query or use temp tables")
-                st.dataframe(results['compilation'][['QUERY_ID', 'USER_NAME', 'COMPILATION_SEC', 'COMPILATION_PCT']].head(10), use_container_width=True)
-        
-        if counts['cache'] > 0:
-            with st.expander(f"⚪ Low Cache Utilization ({counts['cache']} queries)"):
-                st.markdown("**Problem:** Cold data access is slower")
-                st.markdown("**Fix:** Increase warehouse auto-suspend time")
-                st.dataframe(results['cache'][['QUERY_ID', 'USER_NAME', 'CACHE_PCT', 'BYTES_SCANNED_GB']].head(10), use_container_width=True)
         
         if counts['performance'] == 0:
             st.success("No performance issues detected!")
@@ -599,30 +677,66 @@ SELECT * FROM my_table WHERE date_column >= '2024-01-01'""", language='sql')
         
         col1, col2 = st.columns(2)
         with col1:
-            st.metric("Repeated Expensive Queries", counts['repeated'])
+            st.metric("Repeated Expensive", counts['repeated'])
         with col2:
             st.metric("Full Table Scans", counts['full_scan'])
         
         if counts['repeated'] > 0:
             with st.expander(f"🔄 Repeated Expensive Queries ({counts['repeated']} patterns)", expanded=True):
                 st.markdown("**Problem:** Same costly query runs multiple times")
-                st.markdown("**Fix:** Create materialized view or cache results")
-                st.code("""-- Create materialized view:
-CREATE MATERIALIZED VIEW mv_summary AS
-SELECT ... FROM ... WHERE ...;
-
--- Or use result caching (automatic for identical queries)""", language='sql')
+                st.code("CREATE MATERIALIZED VIEW mv_summary AS SELECT ...;", language='sql')
                 display_cols = ['QUERY_ID', 'USER_NAME', 'EXEC_COUNT', 'TOTAL_TIME_SEC', 'AVG_TIME_SEC']
                 st.dataframe(results['repeated'][display_cols].head(10), use_container_width=True)
         
         if counts['full_scan'] > 0:
             with st.expander(f"📊 Full Table Scans ({counts['full_scan']} queries)", expanded=True):
-                st.markdown("**Problem:** Large scans without filters waste resources")
-                st.markdown("**Fix:** Add WHERE clause or LIMIT")
+                st.markdown("**Problem:** Large scans without filters")
                 st.dataframe(results['full_scan'][['QUERY_ID', 'USER_NAME', 'BYTES_SCANNED_GB', 'PARTITIONS']].head(10), use_container_width=True)
         
         if counts['operational'] == 0:
             st.success("No operational issues detected!")
+    
+    elif st.session_state.active_section == 'anomalies':
+        st.subheader("🔮 Anomaly Detection")
+        st.markdown("*Identifying redundant, unexpected, and outlier query patterns*")
+        
+        anomaly_df = results['anomalies']
+        
+        if not anomaly_df.empty:
+            redundant = anomaly_df[anomaly_df['TYPE'] == 'Redundant Executions']
+            off_hours = anomaly_df[anomaly_df['TYPE'] == 'Off-Hours Query']
+            spikes = anomaly_df[anomaly_df['TYPE'] == 'Runtime Spike']
+            
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Redundant Query Patterns", len(redundant))
+            with col2:
+                st.metric("Off-Hours Queries", len(off_hours))
+            with col3:
+                st.metric("Runtime Spikes", len(spikes))
+            
+            if len(redundant) > 0:
+                with st.expander(f"🔁 Redundant Executions ({len(redundant)} patterns)", expanded=True):
+                    st.markdown("**Problem:** Same query runs multiple times within 15-minute windows")
+                    st.markdown("**Fix:** Review scheduling, add caching, or consolidate jobs")
+                    display_cols = ['QUERY_ID', 'USER_NAME', 'WAREHOUSE', 'EXEC_COUNT', 'SHORT_GAPS', 'TOTAL_TIME_SEC', 'SEVERITY']
+                    st.dataframe(redundant[display_cols].head(10), use_container_width=True)
+            
+            if len(spikes) > 0:
+                with st.expander(f"📈 Runtime Spikes ({len(spikes)} queries)", expanded=True):
+                    st.markdown("**Problem:** Query took significantly longer than usual")
+                    st.markdown("**Fix:** Investigate data skew, contention, or parameter changes")
+                    display_cols = ['QUERY_ID', 'USER_NAME', 'WAREHOUSE', 'EXECUTION_TIME_SEC', 'MEDIAN_TIME_SEC', 'Z_SCORE']
+                    st.dataframe(spikes[display_cols].head(10), use_container_width=True)
+            
+            if len(off_hours) > 0:
+                with st.expander(f"🌙 Off-Hours Queries ({len(off_hours)} queries)"):
+                    st.markdown("**Note:** Queries running between midnight and 5 AM")
+                    st.markdown("**Action:** Verify these are intentionally scheduled")
+                    display_cols = ['QUERY_ID', 'USER_NAME', 'WAREHOUSE', 'START_TIME', 'EXECUTION_TIME_SEC']
+                    st.dataframe(off_hours[display_cols].head(10), use_container_width=True)
+        else:
+            st.success("No anomalies detected! Query patterns look normal.")
     
     elif st.session_state.active_section == 'trends':
         st.subheader("📈 Trends & Analysis")
@@ -641,7 +755,7 @@ SELECT ... FROM ... WHERE ...;
             if not warehouse_df.empty:
                 wh_credits = warehouse_df.groupby('WAREHOUSE_NAME')['CREDITS_USED'].sum().sort_values(ascending=True).tail(10)
                 fig = px.bar(x=wh_credits.values, y=wh_credits.index, orientation='h', 
-                            title='Top 10 Warehouses by Credits', labels={'x': 'Credits', 'y': 'Warehouse'})
+                            title='Top Warehouses by Credits', labels={'x': 'Credits', 'y': 'Warehouse'})
                 st.plotly_chart(fig, use_container_width=True)
         
         col1, col2 = st.columns(2)
@@ -657,13 +771,6 @@ SELECT ... FROM ... WHERE ...;
             user_time = df.groupby('USER_NAME')['EXECUTION_TIME_SEC'].sum().sort_values(ascending=False).head(10)
             fig = px.pie(values=user_time.values, names=user_time.index, title='Compute Time by User')
             st.plotly_chart(fig, use_container_width=True)
-        
-        if not warehouse_df.empty:
-            st.markdown("**Credit Usage Trend (24h)**")
-            warehouse_df['HOUR'] = pd.to_datetime(warehouse_df['START_TIME']).dt.floor('H')
-            hourly_credits = warehouse_df.groupby('HOUR')['CREDITS_USED'].sum().reset_index()
-            fig = px.area(hourly_credits, x='HOUR', y='CREDITS_USED', title='Credits Used per Hour')
-            st.plotly_chart(fig, use_container_width=True)
     
     else:
         st.info("👆 Click a category above to view detailed issues")
@@ -675,17 +782,17 @@ SELECT ... FROM ... WHERE ...;
             
             priority_items = []
             if counts['cartesian'] > 0:
-                priority_items.append(f"🔴 **{counts['cartesian']} Cartesian Join Issues** - Missing JOIN conditions cause massive waste")
+                priority_items.append(f"🔴 **{counts['cartesian']} Cartesian Join Issues** - Missing JOIN conditions")
             if counts['spilling'] > 0:
-                priority_items.append(f"🔴 **{counts['spilling']} Memory Spilling Issues** - Upgrade warehouse or optimize queries")
+                priority_items.append(f"🔴 **{counts['spilling']} Memory Spilling Issues** - Upgrade warehouse or optimize")
+            if counts['anomalies'] > 0:
+                priority_items.append(f"🔮 **{counts['anomalies']} Anomalies** - Redundant or unexpected patterns")
             if counts['select_star'] > 0:
-                priority_items.append(f"🟠 **{counts['select_star']} SELECT * Queries** - Use specific column names")
+                priority_items.append(f"🟠 **{counts['select_star']} SELECT * Queries** - Use specific columns")
             if counts['function_filter'] > 0:
                 priority_items.append(f"🟠 **{counts['function_filter']} Function Filter Issues** - Rewrite WHERE clauses")
             if counts['pruning'] > 0:
                 priority_items.append(f"🟡 **{counts['pruning']} Pruning Issues** - Add clustering keys")
-            if counts['repeated'] > 0:
-                priority_items.append(f"🔵 **{counts['repeated']} Repeated Queries** - Consider materialized views")
             
             for item in priority_items[:6]:
                 st.markdown(item)
@@ -693,14 +800,14 @@ SELECT ... FROM ... WHERE ...;
             st.success("🎉 No issues detected! Your queries are running efficiently.")
     
     st.markdown("---")
-    st.caption("Data refreshes every 5 minutes. ACCOUNT_USAGE has up to 45-minute latency.")
+    st.caption(f"Analyzing {len(df):,} queries from the last {hours_back} hours. Data refreshes every 5 minutes.")
 
 else:
-    st.warning("No query history data available for the past 24 hours.")
+    st.warning("No query history data available.")
     st.info("""
     **Possible causes:**
-    - No queries ran in the last 24 hours
-    - Missing ACCOUNTADMIN role or IMPORTED PRIVILEGES on SNOWFLAKE database
+    - No queries ran in the selected time window
+    - Missing ACCOUNTADMIN role or IMPORTED PRIVILEGES
     - ACCOUNT_USAGE has up to 45-minute latency
     
     **To grant access:**
