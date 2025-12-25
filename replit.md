@@ -67,6 +67,8 @@ Each issue includes specific, actionable recommendations for:
 ├── streamlit_app.py           # Main Streamlit application (deploy to Snowsight)
 ├── README.md                  # Comprehensive documentation
 ├── DEPLOYMENT_GUIDE.md        # Quick deployment steps
+├── USER_GUIDE.md              # Dashboard usage guide with UI walkthrough
+├── SNOWSIGHT_SETUP.sql        # SQL setup scripts for permissions
 └── replit.md                  # This file - project information
 ```
 
